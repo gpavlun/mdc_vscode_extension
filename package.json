@@ -3,6 +3,10 @@
   "displayName": "MDC",
   "description": "C syntax checking and translation for Markdown C documents",
   "version": "0.0.2",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gpavlun/mdc_vscode_extension.git"
+  },
   "engines": {
     "vscode": "^1.140.0"
   },
