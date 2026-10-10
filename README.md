@@ -2,6 +2,10 @@
 
 A VS Code extension for writing C code inside Markdown-based source documents, with live compiler diagnostics and automatic transpilation.
 
+## Transpiler (you might need this)
+[mdc_transpiler repo](https://github.com/gpavlun/mdc_transpiler)
+
+
 ## Features
 
 - **Live C syntax checking:** Extracts fenced C code blocks and checks them using Clang without compiling or linking a program.
