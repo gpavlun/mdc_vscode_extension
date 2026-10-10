@@ -1,0 +1,71 @@
+{
+  "name": "mdc",
+  "displayName": "MDC",
+  "description": "C syntax checking and translation for Markdown C documents",
+  "version": "0.0.2",
+  "engines": {
+    "vscode": "^1.140.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:markdown"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configurationDefaults": {
+      "files.associations": {
+        "*.mdc": "markdown",
+        "*.mdh": "markdown"
+      }
+    },
+    "commands": [
+      {
+        "command": "mdc.check",
+        "title": "MDC: Check C Code"
+      }
+    ],
+    "configuration": {
+      "title": "MDC",
+      "properties": {
+        "mdc.clangPath": {
+          "type": "string",
+          "default": "clang",
+          "description": "Path to the Clang executable."
+        },
+        "mdc.clangArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "-std=c11"
+          ],
+          "description": "Additional arguments passed to Clang."
+        },
+        "mdc.executable": {
+          "type": "string",
+          "default": "mdc",
+          "description": "Path or command name of the MDC transpiler executable."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^26.6.5",
+    "@types/vscode": "^1.140.0",
+    "@vscode/vsce": "^4.0.0",
+    "mocha": "^12.0.3",
+    "typescript": "^7.0.2"
+  },
+  "allowScripts": {
+    "@vscode/vsce-sign@2.1.0": true
+  }
+}

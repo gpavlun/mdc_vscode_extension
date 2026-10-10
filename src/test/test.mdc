@@ -1,0 +1,70 @@
+# Test document
+
+This document contains a simple C program demonstrating the use of function prototypes, definitions, and calls. It includes the standard I/O header required for `printf`, declares the functions in [Prototypes](#prototypes), and implements the program driver in [Function: main](#function-main) and the output function in [Function: hello](#function-hello).
+
+- [Headers](#headers): Required library includes.
+- [Prototypes](#prototypes): Function declarations.
+- [Function: main](#function-main): Calls `hello` with two example strings and returns the program's exit status.
+- [Function: hello](#function-hello): Prints a greeting followed by the supplied string.
+
+## Headers
+This code relies on standard IO for the printf function
+```c
+
+#include <stdio.h>
+
+```
+
+
+## Prototypes 
+```c
+
+int main(void);
+void hello(const char *string);
+
+```
+
+## Function: main
+Main, in this program, is a simple driver for the hello function.  
+
+Parameters:
+- none
+
+Returns:
+- int: The final status of the program  
+
+```c
+
+int main(void) {
+
+  hello("world");
+  hello("salad");
+  return 0;
+
+}
+
+```
+
+## Function: hello
+Hello is a simple function that concatenates whatever is passed to it
+with the string "hello". So  
+`hello("world")`  
+would print  
+`> hello world`  
+
+Parameters:
+- const char *string: This is the string that will be printed after "hello"
+
+Returns:
+- none  
+
+```c
+
+void hello(const char *string){
+
+  printf("Hello");
+  printf("%s\n", string);
+  
+}
+
+```
