@@ -48,6 +48,11 @@
           ],
           "description": "Additional arguments passed to Clang."
         },
+        "mdc.compileCommandsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to CMake's compile_commands.json. When empty, the extension will attempt to discover it in the workspace."
+        },
         "mdc.executable": {
           "type": "string",
           "default": "mdc",

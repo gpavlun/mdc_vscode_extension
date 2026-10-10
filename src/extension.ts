@@ -1,11 +1,27 @@
 import * as vscode from "vscode";
 import { spawn } from "node:child_process";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 const diagnostics = vscode.languages.createDiagnosticCollection("mdc");
 const output = vscode.window.createOutputChannel("MDC Transpiler");
 const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const checkGenerations = new Map<string, number>();
+
+interface CompileCommand {
+  directory: string;
+  file: string;
+  arguments?: string[];
+  command?: string;
+}
+
+interface LoadedCompileDatabase {
+  mtimeMs: number;
+  size: number;
+  entries: CompileCommand[];
+}
+
+const compileDatabaseCache = new Map<string, LoadedCompileDatabase>();
 
 function isMdc(document: vscode.TextDocument): boolean {
   if (document.uri.scheme !== "file") return false;
@@ -76,7 +92,309 @@ function parseDiagnostics(stderr: string, document: vscode.TextDocument): vscode
   return result;
 }
 
+/** Split a POSIX compile command into arguments without invoking a shell. */
+function splitCommand(command: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  let tokenStarted = false;
+
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+
+    if (escaped) {
+      current += char;
+      escaped = false;
+      tokenStarted = true;
+      continue;
+    }
+
+    if (char === "\\" && quote !== "'") {
+      escaped = true;
+      tokenStarted = true;
+      continue;
+    }
+
+    if (quote) {
+      if (char === quote) quote = null;
+      else current += char;
+      tokenStarted = true;
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      quote = char;
+      tokenStarted = true;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (tokenStarted) {
+        args.push(current);
+        current = "";
+        tokenStarted = false;
+      }
+      continue;
+    }
+
+    current += char;
+    tokenStarted = true;
+  }
+
+  if (escaped) current += "\\";
+  if (tokenStarted) args.push(current);
+  return args;
+}
+
+function resolveCompileDatabasePath(
+  configuredPath: string,
+  workspaceFolder: vscode.WorkspaceFolder | undefined
+): string | undefined {
+  if (configuredPath.trim()) {
+    let resolved = configuredPath.trim();
+    if (workspaceFolder) {
+      resolved = resolved.replace(/\$\{workspaceFolder\}/g, workspaceFolder.uri.fsPath);
+    }
+    if (!path.isAbsolute(resolved)) {
+      resolved = path.resolve(workspaceFolder?.uri.fsPath ?? process.cwd(), resolved);
+    }
+    return resolved;
+  }
+  return undefined;
+}
+
+async function findCompileDatabase(
+  workspaceFolder: vscode.WorkspaceFolder | undefined
+): Promise<string | undefined> {
+  if (!workspaceFolder) return undefined;
+
+  const root = workspaceFolder.uri.fsPath;
+  const preferred = [
+    path.join(root, "compile_commands.json"),
+    path.join(root, "build", "compile_commands.json"),
+    path.join(root, "cmake-build-debug", "compile_commands.json"),
+    path.join(root, "cmake-build-release", "compile_commands.json")
+  ];
+
+  for (const candidate of preferred) {
+    try {
+      const stat = await fs.stat(candidate);
+      if (stat.isFile()) return candidate;
+    } catch {
+      // Continue looking in other common locations.
+    }
+  }
+
+  const ignoredDirectories = new Set([
+    ".git", ".hg", ".svn", "node_modules", "vendor", "out", "dist"
+  ]);
+  const maxDepth = 4;
+
+  async function searchDirectory(directory: string, depth: number): Promise<string | undefined> {
+    if (depth > maxDepth) return undefined;
+
+    let children;
+    try {
+      children = await fs.readdir(directory, { withFileTypes: true });
+    } catch {
+      return undefined;
+    }
+
+    for (const child of children) {
+      if (child.isFile() && child.name === "compile_commands.json") {
+        return path.join(directory, child.name);
+      }
+    }
+
+    if (depth === maxDepth) return undefined;
+
+    for (const child of children) {
+      if (!child.isDirectory() || ignoredDirectories.has(child.name)) continue;
+      const found = await searchDirectory(path.join(directory, child.name), depth + 1);
+      if (found) return found;
+    }
+
+    return undefined;
+  }
+
+  return searchDirectory(root, 1);
+}
+
+async function loadCompileDatabase(databasePath: string): Promise<CompileCommand[]> {
+  let stat;
+  try {
+    stat = await fs.stat(databasePath);
+  } catch {
+    compileDatabaseCache.delete(databasePath);
+    return [];
+  }
+
+  const cached = compileDatabaseCache.get(databasePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return cached.entries;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(await fs.readFile(databasePath, "utf8"));
+    if (!Array.isArray(parsed)) throw new Error("The JSON root must be an array.");
+
+    const entries = parsed.filter((entry): entry is CompileCommand => {
+      if (!entry || typeof entry !== "object") return false;
+      const candidate = entry as Partial<CompileCommand>;
+      return typeof candidate.directory === "string"
+        && typeof candidate.file === "string"
+        && (Array.isArray(candidate.arguments) || typeof candidate.command === "string");
+    });
+
+    compileDatabaseCache.set(databasePath, {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      entries
+    });
+    return entries;
+  } catch (error) {
+    output.appendLine(`Could not read compile database "${databasePath}": ${String(error)}`);
+    compileDatabaseCache.delete(databasePath);
+    return [];
+  }
+}
+
+function commandSourcePath(entry: CompileCommand): string {
+  return path.resolve(entry.directory, entry.file);
+}
+
+function documentSourceCandidates(document: vscode.TextDocument): string[] {
+  const filePath = document.uri.fsPath;
+  const candidates: string[] = [];
+
+  if (filePath.toLowerCase().endsWith(".mdh")) {
+    candidates.push(filePath.slice(0, -4) + ".c");
+    candidates.push(filePath.slice(0, -4) + ".mdc");
+  } else {
+    candidates.push(filePath.slice(0, -4) + ".c");
+  }
+
+  return candidates.map(candidate =>
+    candidate.toLowerCase().endsWith(".mdc")
+      ? candidate.slice(0, -4) + ".c"
+      : candidate
+  );
+}
+
+function findCompileCommand(
+  entries: CompileCommand[],
+  document: vscode.TextDocument
+): CompileCommand | undefined {
+  const candidates = documentSourceCandidates(document).map(candidate => path.resolve(candidate));
+  const exact = entries.find(entry => candidates.includes(commandSourcePath(entry)));
+  if (exact) return exact;
+
+  // Generated C may live in a build directory. A unique basename match is safe;
+  // ambiguous matches are deliberately rejected rather than selecting the wrong target.
+  const expectedNames = new Set(candidates.map(candidate => path.basename(candidate)));
+  const basenameMatches = entries.filter(entry =>
+    expectedNames.has(path.basename(commandSourcePath(entry)))
+  );
+  return basenameMatches.length === 1 ? basenameMatches[0] : undefined;
+}
+
+function compileArguments(entry: CompileCommand): string[] {
+  const original = entry.arguments ? [...entry.arguments] : splitCommand(entry.command ?? "");
+  if (original.length === 0) return [];
+
+  const args = original.slice(1);
+  const sourcePath = commandSourcePath(entry);
+  const result: string[] = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+
+    if (arg === "-c" || arg === "-MD" || arg === "-MMD" || arg === "-MP"
+      || arg === "-MG" || arg === "-fcolor-diagnostics" || arg === "-fdiagnostics-color"
+      || arg.startsWith("-fdiagnostics-color=")) {
+      continue;
+    }
+
+    if (["-o", "-MF", "-MT", "-MQ", "--serialize-diagnostics"].includes(arg)) {
+      i++;
+      continue;
+    }
+
+    if (arg.startsWith("--output=") || arg.startsWith("-o") && arg.length > 2) continue;
+
+    if (path.isAbsolute(arg) || arg.includes("/") || arg.includes("\\")) {
+      const resolved = path.resolve(entry.directory, arg);
+      if (resolved === sourcePath) continue;
+    }
+
+    if (arg === entry.file || path.resolve(entry.directory, arg) === sourcePath) continue;
+    result.push(arg);
+  }
+
+  return result;
+}
+
+async function getClangInvocation(
+  document: vscode.TextDocument,
+  config: vscode.WorkspaceConfiguration,
+  clangArgs: string[]
+): Promise<{ args: string[]; cwd: string }> {
+  output.appendLine("getClangInvocation reached");
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+  const documentDirectory = path.dirname(document.uri.fsPath);
+  const fallbackCwd = workspaceFolder?.uri.fsPath ?? documentDirectory;
+  const configuredPath = config.get<string>("compileCommandsPath", "");
+  let databasePath = resolveCompileDatabasePath(configuredPath, workspaceFolder);
+
+  if (!databasePath) databasePath = await findCompileDatabase(workspaceFolder);
+
+  output.appendLine(`Workspace: ${workspaceFolder?.uri.fsPath ?? "NONE"}`);
+  output.appendLine(`Database: ${databasePath ?? "NONE"}`);
+
+  if (databasePath) {
+    const entries = await loadCompileDatabase(databasePath);
+    const entry = findCompileCommand(entries, document);
+
+    output.appendLine(`Entries: ${entries.length}`);
+    output.appendLine(`MDC file: ${document.uri.fsPath}`);
+    output.appendLine(`Candidates: ${documentSourceCandidates(document).join(", ")}`);
+    output.appendLine(`Matched C file: ${entry ? commandSourcePath(entry) : "NONE"}`);
+    
+    if (entry) {
+      const args = compileArguments(entry);
+      // The package default is -std=c11. Do not let that default override the
+      // standard already selected by CMake; explicit non-default flags remain
+      // available through mdc.clangArgs.
+      const additionalArgs = args.some(arg => arg.startsWith("-std="))
+        ? clangArgs.filter(arg => arg !== "-std=c11")
+        : clangArgs;
+      return {
+        args: [
+          ...args,
+          ...additionalArgs,
+          "-x", "c", "-fsyntax-only", "-fno-color-diagnostics",
+          "-iquote", documentDirectory,
+          "-"
+        ],
+        cwd: entry.directory
+      };
+    }
+  }
+
+  return {
+    args: [
+      ...clangArgs, "-x", "c", "-fsyntax-only", "-fno-color-diagnostics",
+      "-iquote", documentDirectory,
+      ...(workspaceFolder ? ["-I", workspaceFolder.uri.fsPath] : []), "-"
+    ],
+    cwd: fallbackCwd
+  };
+}
+
 async function checkDocument(document: vscode.TextDocument): Promise<void> {
+  output.appendLine(`checkDocument called: ${document.uri.fsPath}`);
+  
   if (!isMdc(document)) return;
 
   const key = document.uri.toString();
@@ -88,14 +406,7 @@ async function checkDocument(document: vscode.TextDocument): Promise<void> {
   const config = vscode.workspace.getConfiguration("mdc", document.uri);
   const clangPath = config.get<string>("clangPath", "clang");
   const clangArgs = config.get<string[]>("clangArgs", ["-std=c11"]);
-  const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
-  const documentDirectory = path.dirname(document.uri.fsPath);
-  const args = [
-    ...clangArgs, "-x", "c", "-fsyntax-only", "-fno-color-diagnostics",
-    "-iquote", documentDirectory,
-    ...(workspaceFolder ? ["-I", workspaceFolder.uri.fsPath] : []), "-"
-  ];
-  const cwd = workspaceFolder?.uri.fsPath ?? documentDirectory;
+  const invocation = await getClangInvocation(document, config, clangArgs);
 
   const result = await new Promise<{ stderr: string; error?: Error }>((resolve) => {
     let stderr = "";
@@ -105,8 +416,8 @@ async function checkDocument(document: vscode.TextDocument): Promise<void> {
       settled = true;
       resolve(value);
     };
-    const child = spawn(clangPath, args, {
-      cwd, stdio: ["pipe", "ignore", "pipe"]
+    const child = spawn(clangPath, invocation.args, {
+      cwd: invocation.cwd, stdio: ["pipe", "ignore", "pipe"]
     });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => { stderr += chunk; });
